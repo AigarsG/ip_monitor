@@ -54,6 +54,17 @@ Some guides on how to listen for netdev events
 #define NL_BUF_SIZE 8192
 #define NL_MAX_EVENTS 8
 #define NL_MONITOR_NET_IFACE_MAX_COUNT 20
+#define NL_IPV4_LEN 4
+#define NL_IPV6_LEN 16
+
+#define NL_IPV4_STR_FMT "%u.%u.%u.%u"
+#define NL_IPV4_STR_FMT_BYTES(buf) \
+    (buf)[0], (buf)[1], (buf)[2], (buf)[3]
+
+#define NL_IPV6_STR_FMT "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x"
+#define NL_IPV6_STR_FMT_BYTES(buf) \
+    (buf)[0], (buf)[1], (buf)[2], (buf)[3], (buf)[4], (buf)[5], (buf)[6], (buf)[7], (buf)[8], \
+    (buf)[9], (buf)[10], (buf)[11], (buf)[12], (buf)[13], (buf)[14], (buf)[15]
 
 struct net_iface {
     int index;
@@ -63,7 +74,10 @@ struct net_iface {
     int carrier;
     unsigned mtu;
     unsigned char mac[ETH_ALEN];
+    unsigned char ipv4[NL_IPV4_LEN];
+    unsigned char ipv6[NL_IPV6_LEN];
 };
+
 
 static void net_iface_init(struct net_iface *nifaces, size_t count)
 {
@@ -76,6 +90,8 @@ static void net_iface_init(struct net_iface *nifaces, size_t count)
         nifaces[i].carrier = -1;
         nifaces[i].mtu = -1u;
         memset(nifaces[i].mac, 0, sizeof nifaces[i].mac);
+        memset(nifaces[i].ipv4, 0, sizeof nifaces[i].ipv4);
+        memset(nifaces[i].ipv6, 0, sizeof nifaces[i].ipv6);
     }
 }
 
@@ -101,26 +117,45 @@ static struct net_iface *net_iface_next_empty(struct net_iface *nifaces, size_t 
     return NULL;
 }
 
-static int net_iface_is_mac_empty(const struct net_iface *niface)
+static int net_iface_is_buf_empty(const unsigned char *buf, size_t len)
 {
     int i;
-    for (i = 0; i < sizeof niface->mac; i++) {
-        if (niface->mac[i] != 0) {
+    for (i = 0; i < len; i++) {
+        if (buf[i] != 0) {
             return 0;
         }
     }
     return 1;
 }
 
+static int net_iface_is_mac_set(const struct net_iface *niface)
+{
+    return !net_iface_is_buf_empty(niface->mac, sizeof niface->mac);
+}
+
+static int net_iface_is_ipv6_set(const struct net_iface *niface)
+{
+    return !net_iface_is_buf_empty(niface->ipv6, sizeof niface->ipv6);
+}
+
+static int net_iface_is_ipv4_set(const struct net_iface *niface)
+{
+    return !net_iface_is_buf_empty(niface->ipv4, sizeof niface->ipv4);
+}
+
+static int net_iface_is_ipv6_equal(const struct net_iface *one, const struct net_iface *other)
+{
+    return !memcmp(one->ipv6, other->ipv6, sizeof one->ipv6);
+}
+
+static int net_iface_is_ipv4_equal(const struct net_iface *one, const struct net_iface *other)
+{
+    return !memcmp(one->ipv4, other->ipv4, sizeof one->ipv4);
+}
+
 static int net_iface_is_mac_equal(const struct net_iface *one, const struct net_iface *other)
 {
-    int i;
-    for (i = 0; i < sizeof one->mac; i++) {
-        if (one->mac[i] != other->mac[i]) {
-            return 0;
-        }
-    }
-    return 1;
+    return !memcmp(one->mac, other->mac, sizeof one->mac);
 }
 
 static int nl_monitor_init(size_t nl_event_mask)
@@ -189,12 +224,42 @@ static void nl_monitor_parse_rtmgrp_link(const struct nlmsghdr *nlh, struct net_
     }
 }
 
+static void nl_monitor_parse_rtmgrp_addr(const struct nlmsghdr *nlh, struct net_iface *niface)
+{
+    struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nlh);
+    struct rtattr *rtattr;
+    size_t rtattrlen = IFA_PAYLOAD(nlh);
+
+    for (rtattr = IFA_RTA(ifa); RTA_OK(rtattr, rtattrlen); rtattr = RTA_NEXT(rtattr, rtattrlen)) {
+        switch (rtattr->rta_type) {
+        case IFA_ADDRESS:
+            if (RTA_PAYLOAD(rtattr) == NL_IPV6_LEN) {
+                memcpy(niface->ipv6, (unsigned char *)RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
+            } else {
+                memcpy(niface->ipv4, (unsigned char *)RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
+            }
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *nifaces, size_t count)
 {
     /* https://linux.die.net/man/7/rtnetlink */
 
     struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
-    struct net_iface *old = net_iface_find_by_index(ifi->ifi_index, nifaces, count);
+    struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nlh);
+
+    int iface_index;
+    if (nlh->nlmsg_type == RTM_NEWADDR || nlh->nlmsg_type == RTM_DELADDR) {
+        iface_index = ifa->ifa_index;
+    } else {
+        iface_index = ifi->ifi_index;
+    }
+
+    struct net_iface *old = net_iface_find_by_index(iface_index, nifaces, count);
     if (old == NULL) {
         old = net_iface_next_empty(nifaces, count);
     }
@@ -216,10 +281,18 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
     struct net_iface current;
     net_iface_init(&current, 1);
 
-    nl_monitor_parse_rtmgrp_link(nlh, &current);
+    if (nlh->nlmsg_type == RTM_NEWADDR || nlh->nlmsg_type == RTM_DELADDR) {
+        nl_monitor_parse_rtmgrp_addr(nlh, &current);
+    } else {
+        nl_monitor_parse_rtmgrp_link(nlh, &current);
+    }
 
     if (current.ifname[0] == 0) {
         if_indextoname(ifi->ifi_index, current.ifname);
+    }
+
+    if (current.ifname[0] == 0 && old->ifname[0] != 0) {
+        memcpy(current.ifname, old->ifname, sizeof current.ifname);
     }
 
     switch (nlh->nlmsg_type) {
@@ -255,7 +328,7 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
                 }
 
                 /* Check if mac address changed */
-                if (!net_iface_is_mac_empty(&current) && !net_iface_is_mac_equal(old, &current)) {
+                if (net_iface_is_mac_set(&current) && !net_iface_is_mac_equal(old, &current)) {
                     mac_changed = 1;
                 }
 
@@ -290,8 +363,45 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
             old->mtu = current.mtu;
         }
 
-        if (!net_iface_is_mac_empty(&current)) {
+        if (net_iface_is_mac_set(&current)) {
             memcpy(old->mac, current.mac, sizeof old->mac);
+        }
+
+        break;
+
+    case RTM_DELADDR:
+        if (net_iface_is_ipv6_set(&current)) {
+            printf("[%s] Removed IPV6 address "NL_IPV6_STR_FMT" from interface %s\n", timestamp,
+                   NL_IPV6_STR_FMT_BYTES(current.ipv6), current.ifname);
+            memset(old->ipv6, 0, sizeof old->ipv6);
+        } else {
+            printf("[%s] Removed IPV4 address "NL_IPV4_STR_FMT" from interface %s\n", timestamp,
+                   NL_IPV4_STR_FMT_BYTES(current.ipv4), current.ifname);
+            memset(old->ipv4, 0, sizeof old->ipv4);
+        }
+        break;
+    case RTM_NEWADDR:
+        if (net_iface_is_ipv6_set(&current)) {
+            if (!net_iface_is_ipv6_set(old)) {
+                printf("[%s] New IPV6 address "NL_IPV6_STR_FMT" set on interface %s\n", timestamp,
+                       NL_IPV6_STR_FMT_BYTES(current.ipv6), current.ifname);
+            } else if (!net_iface_is_ipv6_equal(&current, old)) {
+                printf("[%s] IPV6 address changed on interface %s "NL_IPV6_STR_FMT" -> "NL_IPV6_STR_FMT"\n",
+                       timestamp, current.ifname, NL_IPV6_STR_FMT_BYTES(old->ipv6), NL_IPV6_STR_FMT_BYTES(current.ipv6));
+            }
+
+            memcpy(old->ipv6, current.ipv6, sizeof old->ipv6);
+        } else {
+
+            if (!net_iface_is_ipv4_set(old)) {
+                printf("[%s] New IPV4 address "NL_IPV4_STR_FMT" set on interface %s\n", timestamp,
+                       NL_IPV4_STR_FMT_BYTES(current.ipv4), current.ifname);
+            } else if (!net_iface_is_ipv4_equal(&current, old)){
+                printf("[%s] IPV4 address changed on interface %s "NL_IPV4_STR_FMT" -> "NL_IPV4_STR_FMT"\n",
+                       timestamp, current.ifname, NL_IPV4_STR_FMT_BYTES(old->ipv4), NL_IPV4_STR_FMT_BYTES(current.ipv4));
+            }
+
+            memcpy(old->ipv4, current.ipv4, sizeof old->ipv4);
         }
 
         break;
@@ -388,7 +498,7 @@ err:
 
 int main(int argc, char **argv)
 {
-    int nl_socket = nl_monitor_init(RTMGRP_LINK);
+    int nl_socket = nl_monitor_init(RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR);
     if (nl_socket == -1) {
         return -1;
     }
