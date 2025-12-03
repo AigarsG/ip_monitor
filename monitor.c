@@ -42,6 +42,7 @@ Some guides on how to listen for netdev events
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
+#include <net/if.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <linux/netlink.h>
@@ -55,17 +56,23 @@ Some guides on how to listen for netdev events
 
 struct net_iface {
     int index;
+    char ifname[IFNAMSIZ];
     unsigned flags;
+    unsigned change;
     int carrier;
+    unsigned mtu;
 };
 
 static void net_iface_init(struct net_iface *nifaces, size_t count)
 {
     int i;
     for (i = 0; i < count; i++) {
+        memset(nifaces[i].ifname, 0, sizeof nifaces[i].ifname);
         nifaces[i].index = -1;
         nifaces[i].flags = -1u;
+        nifaces[i].change = -1u;
         nifaces[i].carrier = -1;
+        nifaces[i].mtu = -1u;
     }
 }
 
@@ -120,105 +127,115 @@ err:
     return -1;
 }
 
+static void nl_monitor_parse_rtmgrp_link(const struct nlmsghdr *nlh, struct net_iface *niface)
+{
+    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
+    struct rtattr *rtattr;
+    size_t rtattrlen = IFLA_PAYLOAD(nlh);
+
+    niface->index = ifi->ifi_index;
+    niface->flags = ifi->ifi_flags;
+    niface->change = ifi->ifi_change;
+
+    /* Description of message attributes can be found here
+     * https://www.man7.org/linux/man-pages/man7/rtnetlink.7.html
+     * uapi/linux/if_link.h
+     * https://www.kernel.org/doc/html/next/networking/netlink_spec/rt_link.html#rt-link-attribute-set-link-attrs
+     */
+
+    /* Parse link layer attributes */
+    for (rtattr = IFLA_RTA(ifi); RTA_OK(rtattr, rtattrlen); rtattr = RTA_NEXT(rtattr, rtattrlen)) {
+        switch (rtattr->rta_type) {
+        case IFLA_IFNAME:
+            memcpy(niface->ifname, RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
+            break;
+        case IFLA_CARRIER:
+            niface->carrier = *((unsigned char *)RTA_DATA(rtattr));
+            break;
+        case IFLA_MTU:
+            niface->mtu = *((unsigned *)RTA_DATA(rtattr));
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *nifaces, size_t count)
 {
     /* https://linux.die.net/man/7/rtnetlink */
 
-    /* Description of message attributes can be found here
-     * https://www.man7.org/linux/man-pages/man7/rtnetlink.7.html
-     */
-    struct rtattr *rta;
-    char ifname[IFNAMSIZ];
-    int carrier = -1;
+    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
+    struct net_iface *old = net_iface_find_by_index(ifi->ifi_index, nifaces, count);
+    if (old == NULL) {
+        old = net_iface_next_empty(nifaces, count);
+    }
 
-    /* Length of attributes */
-    size_t rtl = IFLA_PAYLOAD(nlh);
+    /* For now track fixed amount of interfaces */
+    if (old == NULL) {
+        fprintf(stderr, "ERROR: cannot monitor more than %lu interfaces\n", count);
+        return;
+    }
 
-    if (nlh->nlmsg_type == RTM_NEWLINK || nlh->nlmsg_type == RTM_DELLINK) {
+    char timestamp[100];
+    time_t current_time = time(NULL);
+    struct tm *time_struct = localtime(&current_time);
 
-        struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
-        struct net_iface *niface = net_iface_find_by_index(ifi->ifi_index, nifaces, count);
-        if (niface == NULL) {
-            niface = net_iface_next_empty(nifaces, count);
-        }
+    /* Output timestamp in format YYYY-MM-DD HH:MM:SS */
+    strftime(timestamp, sizeof timestamp, "%Y-%m-%d %H:%M:%S", time_struct);
 
-        /* See uapi/linux/if_link.h */
-        /* In order to decode attrs, see
-         * https://www.kernel.org/doc/html/next/networking/netlink_spec/rt_link.html#rt-link-attribute-set-link-attrs
-         */
+    /* Retrieve current information about the interface */
+    struct net_iface current;
+    net_iface_init(&current, 1);
 
-        /* Parse attributes */
-        for (rta = IFLA_RTA(ifi); RTA_OK(rta, rtl); rta = RTA_NEXT(rta, rtl)) {
-            switch (rta->rta_type) {
-            case IFLA_IFNAME:
-                memset(ifname, 0, sizeof ifname);
-                memcpy(ifname, RTA_DATA(rta), RTA_PAYLOAD(rta));
-                break;
-            case IFLA_CARRIER:
-                carrier = !!(*((unsigned char *)RTA_DATA(rta)));
-                break;
-            default:
-                break;
-            }
-        }
+    nl_monitor_parse_rtmgrp_link(nlh, &current);
 
-        char timestamp[100];
-        time_t current_time = time(NULL);
-        struct tm *time_struct = localtime(&current_time);
+    if (current.ifname[0] == 0) {
+        if_indextoname(ifi->ifi_index, current.ifname);
+    }
 
-        /* Output timestamp in format YYYY-MM-DD HH:MM:SS */
-        strftime(timestamp, sizeof timestamp, "%Y-%m-%d %H:%M:%S", time_struct);
-
-        if (nlh->nlmsg_type == RTM_DELLINK) {
-            printf("[%s] Interface %s removed\n", timestamp, ifname);
-            if (niface) {
-                net_iface_init(niface, 1);
-            }
-        } else {
+    switch (nlh->nlmsg_type) {
+    case RTM_DELLINK:
+        printf("[%s] Interface %s removed\n", timestamp, current.ifname);
+        net_iface_init(old, 1);
+        break;
+    case RTM_NEWLINK:
+        if (current.change == -1u) {
             /* According to linux kernel when new interface is added change bitmap
              * is set to max unsigned int. See /net/core/dev.c::register_netdevice
              */
-            if (ifi->ifi_change == -1u) {
-                printf("[%s] Interface %s added\n", timestamp, ifname);
-                if (niface) {
-                    niface->index = ifi->ifi_index;
-                    niface->flags = ifi->ifi_flags;
-                    niface->carrier = carrier;
-                }
+            printf("[%s] Interface %s added\n", timestamp, current.ifname);
+        } else {
+            if (old->index == -1) {
+                /* Reporting interface status for the first time */
+                printf("[%s] Interface %s is %s (carrier %s)\n", timestamp,
+                       current.ifname, (current.flags & IFF_UP) ? "UP" : "DOWN",
+                       current.carrier == 1 ? "ON" : "OFF");
             } else {
+                unsigned status_changed = current.flags ^ old->flags;
+                unsigned carrier_changed = current.carrier != old->carrier;
 
-                if (niface) {
-                    if (niface->index == -1) {
-                        /* Report first-time status */
-                        printf("[%s] Interface %s is %s (carrier %s)\n", timestamp, ifname,
-                               (ifi->ifi_flags & IFF_UP) ? "UP" : "DOWN", carrier ? "ON" : "OFF");
-                    } else {
-                        unsigned flag_changes = niface->flags ^ ifi->ifi_flags;
-                        unsigned carrier_changes = 0;
+                /* Sometimes we don't get attribute on carrier status */
+                if (current.carrier == -1) {
+                    carrier_changed = 0;
+                }
 
-                        if (carrier != -1) {
-                            carrier_changes = niface->carrier != carrier;
-                        }
-
-                        if ((flag_changes & IFF_UP) || carrier_changes) {
-                            printf("[%s] Interface %s is %s (carrier %s)\n", timestamp, ifname,
-                               (ifi->ifi_flags & IFF_UP) ? "UP" : "DOWN", carrier ? "ON" : "OFF");
-                        }
-                    }
-                    niface->index = ifi->ifi_index;
-                    niface->flags = ifi->ifi_flags;
-                    niface->carrier = carrier;
-                } else {
-                    /* No place to cache info, try unreliable ifi_change mask */
-                    if (ifi->ifi_change & IFF_UP) {
-                        printf("[%s] Interface %s is %s (carrier %s)\n", timestamp,
-                               ifname, (ifi->ifi_flags & IFF_UP) ? "UP" : "DOWN",
-                               carrier ? "ON" : "OFF");
-                    }
+                if ((status_changed & IFF_UP) || carrier_changed) {
+                    printf("[%s] Interface %s is %s (carrier %s)\n", timestamp, current.ifname,
+                           (current.flags & IFF_UP) ? "UP" : "DOWN",
+                           current.carrier == 1 ? "ON" : "OFF");
                 }
             }
         }
 
+        old->index = current.index;
+        old->flags = current.flags;
+
+        if (current.carrier != -1) {
+            old->carrier = current.carrier;
+        }
+
+        break;
     }
 }
 
