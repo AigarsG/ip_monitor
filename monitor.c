@@ -352,7 +352,7 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
                     carrier_changed = 0;
                 }
 
-                if (current.mtu == -1) {
+                if (current.mtu == -1u) {
                     mtu_changed = 0;
                 }
 
