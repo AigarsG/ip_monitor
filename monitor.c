@@ -66,6 +66,10 @@ Some guides on how to listen for netdev events
     (buf)[0], (buf)[1], (buf)[2], (buf)[3], (buf)[4], (buf)[5], (buf)[6], (buf)[7], (buf)[8], \
     (buf)[9], (buf)[10], (buf)[11], (buf)[12], (buf)[13], (buf)[14], (buf)[15]
 
+#define NL_MAC_STR_FMT "%02x:%02x:%02x:%02x:%02x:%02x"
+#define NL_MAC_STR_FMT_BYTES(buf) \
+    (buf)[0], (buf)[1], (buf)[2], (buf)[3], (buf)[4], (buf)[5]
+
 struct net_iface {
     int index;
     char ifname[IFNAMSIZ];
@@ -136,21 +140,6 @@ static int net_iface_is_mac_set(const struct net_iface *niface)
 static int net_iface_is_ipv6_set(const struct net_iface *niface)
 {
     return !net_iface_is_buf_empty(niface->ipv6, sizeof niface->ipv6);
-}
-
-static int net_iface_is_ipv4_set(const struct net_iface *niface)
-{
-    return !net_iface_is_buf_empty(niface->ipv4, sizeof niface->ipv4);
-}
-
-static int net_iface_is_ipv6_equal(const struct net_iface *one, const struct net_iface *other)
-{
-    return !memcmp(one->ipv6, other->ipv6, sizeof one->ipv6);
-}
-
-static int net_iface_is_ipv4_equal(const struct net_iface *one, const struct net_iface *other)
-{
-    return !memcmp(one->ipv4, other->ipv4, sizeof one->ipv4);
 }
 
 static int net_iface_is_mac_equal(const struct net_iface *one, const struct net_iface *other)
@@ -316,10 +305,6 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
         if_indextoname(ifi->ifi_index, current.ifname);
     }
 
-    if (current.ifname[0] == 0 && old->ifname[0] != 0) {
-        memcpy(current.ifname, old->ifname, sizeof current.ifname);
-    }
-
     if (net_iface_should_ignore(&current, filter)) {
         return;
     }
@@ -329,56 +314,64 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
         printf("[%s] Interface %s removed\n", timestamp, current.ifname);
         net_iface_init(old, 1);
         break;
-    case RTM_NEWLINK:
-        if (current.change == -1u) {
-            /* According to linux kernel when new interface is added change bitmap
-             * is set to max unsigned int. See /net/core/dev.c::register_netdevice
-             */
-            printf("[%s] Interface %s added\n", timestamp, current.ifname);
-        } else {
-            if (old->index == -1) {
-                /* Reporting interface status for the first time */
-                printf("[%s] Interface %s is %s (carrier %s)\n", timestamp,
-                       current.ifname, (current.flags & IFF_UP) ? "UP" : "DOWN",
-                       current.carrier == 1 ? "ON" : "OFF");
-            } else {
-                unsigned status_changed = current.flags ^ old->flags;
-                unsigned carrier_changed = current.carrier != old->carrier;
-                unsigned mtu_changed = current.mtu != old->mtu;
-                unsigned mac_changed = 0;
+    case RTM_NEWLINK: {
+        unsigned status_changed = current.flags ^ old->flags;
+        unsigned carrier_changed = 0;
 
-                /* Sometimes we don't get attribute on carrier status */
-                if (current.carrier == -1) {
-                    carrier_changed = 0;
-                }
+        if (current.carrier != -1) {
+            carrier_changed = current.carrier != old->carrier;
+        }
 
-                if (current.mtu == -1u) {
-                    mtu_changed = 0;
-                }
+        if (old->index == -1) {
+            /* First time reporting status */
+            status_changed = 0;
+            carrier_changed = 0;
+        }
 
-                /* Check if mac address changed */
-                if (net_iface_is_mac_set(&current) && !net_iface_is_mac_equal(old, &current)) {
-                    mac_changed = 1;
-                }
-
-                if ((status_changed & IFF_UP) || carrier_changed) {
-                    printf("[%s] Interface %s is %s (carrier %s)\n", timestamp, current.ifname,
-                           (current.flags & IFF_UP) ? "UP" : "DOWN",
-                           current.carrier == 1 ? "ON" : "OFF");
-                }
-
-                if (mtu_changed) {
-                    printf("[%s] MTU for interface %s changed %u -> %u\n", timestamp, current.ifname,
-                           old->mtu, current.mtu);
-                }
-
-                if (mac_changed) {
-                    printf("[%s] MAC for interface %s changed %02x:%02x:%02x::%02x:%02x:%02x -> %02x:%02x:%02x::%02x:%02x:%02x\n",
-                           timestamp, current.ifname, old->mac[0], old->mac[1], old->mac[2], old->mac[3], old->mac[4],
-                           old->mac[5], current.mac[0], current.mac[1], current.mac[2], current.mac[3], current.mac[4],
-                           current.mac[5]);
-                }
+        if ((old->index == -1) || (status_changed & IFF_UP) || carrier_changed) {
+            int carrier = current.carrier;
+            if (carrier == -1) {
+                carrier = old->carrier;
             }
+
+            if (current.change == -1u) {
+                /* According to linux kernel when new interface is added change bitmap
+                 * is set to max unsigned int. See /net/core/dev.c::register_netdevice
+                 */
+                printf("[%s] Interface %s added\n", timestamp, current.ifname);
+            }
+
+            if (carrier == -1) {
+                printf("[%s] Interface %s is %s\n", timestamp, current.ifname,
+                       (current.flags & IFF_UP) ? "UP" : "DOWN");
+            } else {
+                printf("[%s] Interface %s is %s (carrier %s)\n", timestamp, current.ifname,
+                       (current.flags & IFF_UP) ? "UP" : "DOWN",
+                       carrier ? "ON" : "OFF");
+            }
+        }
+
+        /* Check if MTU changed */
+        if (current.mtu != -1u && current.mtu != old->mtu) {
+            if (old->mtu != -1u) {
+                printf("[%s] MTU for interface %s changed %u -> %u\n", timestamp, current.ifname,
+                       old->mtu, current.mtu);
+            } else {
+                printf("[%s] MTU for interface %s is set to %u\n", timestamp, current.ifname, current.mtu);
+            }
+            old->mtu = current.mtu;
+        }
+
+        /* Check if mac address changed */
+        if (net_iface_is_mac_set(&current) && !net_iface_is_mac_equal(old, &current)) {
+            if (!net_iface_is_mac_set(old)) {
+                printf("[%s] MAC for interface %s is set to "NL_MAC_STR_FMT"\n", timestamp, current.ifname,
+                   NL_MAC_STR_FMT_BYTES(current.mac));
+            } else {
+                printf("[%s] MAC for interface %s changed "NL_MAC_STR_FMT" -> "NL_MAC_STR_FMT"\n", timestamp, current.ifname,
+                       NL_MAC_STR_FMT_BYTES(old->mac), NL_MAC_STR_FMT_BYTES(current.mac));
+            }
+            memcpy(old->mac, current.mac, sizeof old->mac);
         }
 
         old->index = current.index;
@@ -388,51 +381,25 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
             old->carrier = current.carrier;
         }
 
-        if (current.mtu != -1u) {
-            old->mtu = current.mtu;
-        }
-
-        if (net_iface_is_mac_set(&current)) {
-            memcpy(old->mac, current.mac, sizeof old->mac);
-        }
-
         break;
-
+    }
     case RTM_DELADDR:
         if (net_iface_is_ipv6_set(&current)) {
             printf("[%s] Removed IPV6 address "NL_IPV6_STR_FMT" from interface %s\n", timestamp,
                    NL_IPV6_STR_FMT_BYTES(current.ipv6), current.ifname);
-            memset(old->ipv6, 0, sizeof old->ipv6);
         } else {
             printf("[%s] Removed IPV4 address "NL_IPV4_STR_FMT" from interface %s\n", timestamp,
                    NL_IPV4_STR_FMT_BYTES(current.ipv4), current.ifname);
-            memset(old->ipv4, 0, sizeof old->ipv4);
         }
         break;
     case RTM_NEWADDR:
         if (net_iface_is_ipv6_set(&current)) {
-            if (!net_iface_is_ipv6_set(old)) {
-                printf("[%s] New IPV6 address "NL_IPV6_STR_FMT" set on interface %s\n", timestamp,
-                       NL_IPV6_STR_FMT_BYTES(current.ipv6), current.ifname);
-            } else if (!net_iface_is_ipv6_equal(&current, old)) {
-                printf("[%s] IPV6 address changed on interface %s "NL_IPV6_STR_FMT" -> "NL_IPV6_STR_FMT"\n",
-                       timestamp, current.ifname, NL_IPV6_STR_FMT_BYTES(old->ipv6), NL_IPV6_STR_FMT_BYTES(current.ipv6));
-            }
-
-            memcpy(old->ipv6, current.ipv6, sizeof old->ipv6);
+            printf("[%s] New IPV6 address "NL_IPV6_STR_FMT" set on interface %s\n", timestamp,
+                   NL_IPV6_STR_FMT_BYTES(current.ipv6), current.ifname);
         } else {
-
-            if (!net_iface_is_ipv4_set(old)) {
-                printf("[%s] New IPV4 address "NL_IPV4_STR_FMT" set on interface %s\n", timestamp,
-                       NL_IPV4_STR_FMT_BYTES(current.ipv4), current.ifname);
-            } else if (!net_iface_is_ipv4_equal(&current, old)){
-                printf("[%s] IPV4 address changed on interface %s "NL_IPV4_STR_FMT" -> "NL_IPV4_STR_FMT"\n",
-                       timestamp, current.ifname, NL_IPV4_STR_FMT_BYTES(old->ipv4), NL_IPV4_STR_FMT_BYTES(current.ipv4));
-            }
-
-            memcpy(old->ipv4, current.ipv4, sizeof old->ipv4);
+            printf("[%s] New IPV4 address "NL_IPV4_STR_FMT" set on interface %s\n", timestamp,
+                   NL_IPV4_STR_FMT_BYTES(current.ipv4), current.ifname);
         }
-
         break;
     }
 }
