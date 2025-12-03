@@ -49,6 +49,7 @@ Some guides on how to listen for netdev events
 #include <linux/rtnetlink.h>
 #include <linux/if.h>
 #include <linux/if_link.h>
+#include <linux/if_ether.h>
 
 #define NL_BUF_SIZE 8192
 #define NL_MAX_EVENTS 8
@@ -61,6 +62,7 @@ struct net_iface {
     unsigned change;
     int carrier;
     unsigned mtu;
+    unsigned char mac[ETH_ALEN];
 };
 
 static void net_iface_init(struct net_iface *nifaces, size_t count)
@@ -73,6 +75,7 @@ static void net_iface_init(struct net_iface *nifaces, size_t count)
         nifaces[i].change = -1u;
         nifaces[i].carrier = -1;
         nifaces[i].mtu = -1u;
+        memset(nifaces[i].mac, 0, sizeof nifaces[i].mac);
     }
 }
 
@@ -96,6 +99,28 @@ static struct net_iface *net_iface_next_empty(struct net_iface *nifaces, size_t 
         }
     }
     return NULL;
+}
+
+static int net_iface_is_mac_empty(const struct net_iface *niface)
+{
+    int i;
+    for (i = 0; i < sizeof niface->mac; i++) {
+        if (niface->mac[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int net_iface_is_mac_equal(const struct net_iface *one, const struct net_iface *other)
+{
+    int i;
+    for (i = 0; i < sizeof one->mac; i++) {
+        if (one->mac[i] != other->mac[i]) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static int nl_monitor_init(size_t nl_event_mask)
@@ -154,6 +179,9 @@ static void nl_monitor_parse_rtmgrp_link(const struct nlmsghdr *nlh, struct net_
             break;
         case IFLA_MTU:
             niface->mtu = *((unsigned *)RTA_DATA(rtattr));
+            break;
+        case IFLA_ADDRESS:
+            memcpy(niface->mac, (unsigned char *)RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
             break;
         default:
             break;
@@ -214,16 +242,39 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
             } else {
                 unsigned status_changed = current.flags ^ old->flags;
                 unsigned carrier_changed = current.carrier != old->carrier;
+                unsigned mtu_changed = current.mtu != old->mtu;
+                unsigned mac_changed = 0;
 
                 /* Sometimes we don't get attribute on carrier status */
                 if (current.carrier == -1) {
                     carrier_changed = 0;
                 }
 
+                if (current.mtu == -1) {
+                    mtu_changed = 0;
+                }
+
+                /* Check if mac address changed */
+                if (!net_iface_is_mac_empty(&current) && !net_iface_is_mac_equal(old, &current)) {
+                    mac_changed = 1;
+                }
+
                 if ((status_changed & IFF_UP) || carrier_changed) {
                     printf("[%s] Interface %s is %s (carrier %s)\n", timestamp, current.ifname,
                            (current.flags & IFF_UP) ? "UP" : "DOWN",
                            current.carrier == 1 ? "ON" : "OFF");
+                }
+
+                if (mtu_changed) {
+                    printf("[%s] MTU for interface %s changed %u -> %u\n", timestamp, current.ifname,
+                           old->mtu, current.mtu);
+                }
+
+                if (mac_changed) {
+                    printf("[%s] MAC for interface %s changed %02x:%02x:%02x::%02x:%02x:%02x -> %02x:%02x:%02x::%02x:%02x:%02x\n",
+                           timestamp, current.ifname, old->mac[0], old->mac[1], old->mac[2], old->mac[3], old->mac[4],
+                           old->mac[5], current.mac[0], current.mac[1], current.mac[2], current.mac[3], current.mac[4],
+                           current.mac[5]);
                 }
             }
         }
@@ -233,6 +284,14 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
 
         if (current.carrier != -1) {
             old->carrier = current.carrier;
+        }
+
+        if (current.mtu != -1u) {
+            old->mtu = current.mtu;
+        }
+
+        if (!net_iface_is_mac_empty(&current)) {
+            memcpy(old->mac, current.mac, sizeof old->mac);
         }
 
         break;
