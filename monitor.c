@@ -158,6 +158,30 @@ static int net_iface_is_mac_equal(const struct net_iface *one, const struct net_
     return !memcmp(one->mac, other->mac, sizeof one->mac);
 }
 
+static int net_iface_should_ignore(const struct net_iface *niface, const char *filter)
+{
+    if (!filter)
+        return 0;
+
+    size_t filter_len = strlen(filter);
+    if (filter_len > sizeof niface->ifname) {
+        filter_len = sizeof niface->ifname;
+    }
+
+    int i;
+    for (i = 0; i < filter_len; i++) {
+        if (filter[i] != niface->ifname[i]) {
+            if (filter[i] == '*' && i == filter_len - 1) {
+                return 0;
+            } else {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static int nl_monitor_init(size_t nl_event_mask)
 {
     int rc = 0;
@@ -245,7 +269,8 @@ static void nl_monitor_parse_rtmgrp_addr(const struct nlmsghdr *nlh, struct net_
     }
 }
 
-static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *nifaces, size_t count)
+static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *nifaces, size_t count,
+                                  const char *filter)
 {
     /* https://linux.die.net/man/7/rtnetlink */
 
@@ -293,6 +318,10 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
 
     if (current.ifname[0] == 0 && old->ifname[0] != 0) {
         memcpy(current.ifname, old->ifname, sizeof current.ifname);
+    }
+
+    if (net_iface_should_ignore(&current, filter)) {
+        return;
     }
 
     switch (nlh->nlmsg_type) {
@@ -408,7 +437,7 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
     }
 }
 
-static void nl_monitor_start(int socket_fd)
+static void nl_monitor_start(int socket_fd, const char *filter)
 {
     int epfd = epoll_create(1);
     if (epfd == -1) {
@@ -484,7 +513,7 @@ static void nl_monitor_start(int socket_fd)
                         /* Process netlink messages */
                         struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
                         for (; NLMSG_OK(nlh, read); nlh = NLMSG_NEXT(nlh, read)) {
-                            nl_monitor_handle_msg(nlh, nifaces, NL_MONITOR_NET_IFACE_MAX_COUNT);
+                            nl_monitor_handle_msg(nlh, nifaces, NL_MONITOR_NET_IFACE_MAX_COUNT, filter);
                         }
                     }
                 }
@@ -498,12 +527,22 @@ err:
 
 int main(int argc, char **argv)
 {
-    int nl_socket = nl_monitor_init(RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR);
+    const char *filter = NULL;
+
+    if (argc == 2) {
+        filter = argv[1];
+    }
+
+    size_t event_mask = RTMGRP_LINK;
+    event_mask |= RTMGRP_IPV4_IFADDR;
+    event_mask |= RTMGRP_IPV6_IFADDR;
+
+    int nl_socket = nl_monitor_init(event_mask);
     if (nl_socket == -1) {
         return -1;
     }
 
-    nl_monitor_start(nl_socket);
+    nl_monitor_start(nl_socket, filter);
 
     close(nl_socket);
 
