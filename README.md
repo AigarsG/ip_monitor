@@ -8,10 +8,6 @@ Simple network interface monitoring program based on netlink which captures link
 4) Either the current interface state is output or the detected changes (compared to the cached state) are output.
 5) Back to step 2
 
-Notes
-- There is no longer a compile-time limit (NL_MONITOR_NET_IFACE_MAX_COUNT) on how many interfaces may be tracked. Entries are allocated on demand and freed when an interface is removed.
-- The program is single-threaded; if you integrate this code into a multi-threaded application, add synchronization around the interface list.
-
 ## Build
 `cd ip_monitor && make`
 
