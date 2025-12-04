@@ -1,39 +1,15 @@
 /*
-https://www.man7.org/linux/man-pages/man7/netlink.7.html
-
-Netlink messages consist of a byte stream with one or multiple
-nlmsghdr headers and associated payload.  The byte stream should
-be accessed only with the standard NLMSG_* macros.  See netlink(3)
-for further information.
-*/
-
-/*
-https://www.kernel.org/doc/html/next/userspace-api/netlink/intro.html
-
-Netlink expects that the user buffer will be at least 8kB or a page size of
-the CPU architecture, whichever is bigger. Particular Netlink families may,
-however, require a larger buffer. 32kB buffer is recommended for most efficient
-handling of dumps (larger buffer fits more dumped objects and therefore fewer recvmsg()
-calls are needed).
-*/
-
-/*
-https://www.man7.org/linux/man-pages/man3/netlink.3.html
-
-<linux/netlink.h> defines several standard macros to access or
-create a netlink datagram.  They are similar in spirit to the
-macros defined in cmsg(3) for auxiliary data.  The buffer passed
-to and from a netlink socket should be accessed using only these
-macros.
-
-Parse and build netlink messages using these macros
-*/
-
-/*
-https://thelinuxcode.com/c-recv-function-usage/
-https://www.linuxjournal.com/article/8498
-
-Some guides on how to listen for netdev events
+monitor.c (refactor)
+- Replaced fixed-size array of monitored interfaces with a dynamic linked list.
+- Added unique per-interface IPv4/IPv6 address lists to deduplicate multiple
+  RTM_NEWADDR notifications for the same address.
+- Introduced a generic linked-list node (llnode) and a generic list manager
+  (net_iface_list) that stores head/tail/count. Each llnode contains a fixed
+  sized data[] buffer to avoid many small allocations; data_size indicates the
+  actual payload size stored in the node.
+- Added signal handler (SIGINT/SIGTERM) and graceful shutdown to ensure all
+  dynamically allocated llnodes are freed before process exit (fixes valgrind
+  "still reachable" blocks).
 */
 
 #include <stdio.h>
@@ -51,6 +27,8 @@ Some guides on how to listen for netdev events
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <signal.h>
 
 #define NL_BUF_SIZE 8192
 #define NL_MAX_EVENTS 8
@@ -58,6 +36,9 @@ Some guides on how to listen for netdev events
 /* #define NL_MONITOR_NET_IFACE_MAX_COUNT 20 */
 #define NL_IPV4_LEN 4
 #define NL_IPV6_LEN 16
+
+/* LLNODE_DATA_MAX_SIZE must fit struct net_iface (without prev/next) and IPv6 addr */
+#define LLNODE_DATA_MAX_SIZE 256
 
 #define NL_IPV4_STR_FMT "%u.%u.%u.%u"
 #define NL_IPV4_STR_FMT_BYTES(buf) \
@@ -72,6 +53,31 @@ Some guides on how to listen for netdev events
 #define NL_MAC_STR_FMT_BYTES(buf) \
     (buf)[0], (buf)[1], (buf)[2], (buf)[3], (buf)[4], (buf)[5]
 
+/* Stop flag set by signal handler to request graceful shutdown */
+static volatile sig_atomic_t g_stop = 0;
+
+static void handle_sigint(int signum)
+{
+    (void)signum;
+    g_stop = 1;
+}
+
+/* Generic linked-list node with embedded fixed-size data buffer */
+struct llnode {
+    struct llnode *prev;
+    struct llnode *next;
+    size_t data_size;
+    unsigned char data[LLNODE_DATA_MAX_SIZE];
+};
+
+/* Generic list manager; name preserved as net_iface_list per guidelines */
+struct net_iface_list {
+    struct llnode *head;
+    struct llnode *tail;
+    size_t count;
+};
+
+/* Per-interface state (payload stored inside an llnode when used in a list) */
 struct net_iface {
     int index;
     char ifname[IFNAMSIZ];
@@ -80,22 +86,101 @@ struct net_iface {
     int carrier;
     unsigned mtu;
     unsigned char mac[ETH_ALEN];
-    unsigned char ipv4[NL_IPV4_LEN];
-    unsigned char ipv6[NL_IPV6_LEN];
 
-    /* linked list pointers for dynamic storage of arbitrary number of ifaces */
-    struct net_iface *prev;
-    struct net_iface *next;
+    /* ipv4 and ipv6 address lists (each element holds raw address bytes) */
+    struct net_iface_list ipv4_addrs; /* nodes hold 4-byte payloads */
+    struct net_iface_list ipv6_addrs; /* nodes hold 16-byte payloads */
 };
 
-/* manager for linked list of interfaces */
-struct net_iface_list {
-    struct net_iface *head;
-    struct net_iface *tail;
-    size_t count;
-};
+/* ---------- Generic llnode/list helpers ---------- */
 
-/* initialize a single net_iface structure (reset fields) */
+static void llist_init(struct net_iface_list *list)
+{
+    if (!list) return;
+    list->head = list->tail = NULL;
+    list->count = 0;
+}
+
+static void llist_free_all(struct net_iface_list *list)
+{
+    if (!list) return;
+    struct llnode *it = list->head;
+    while (it) {
+        struct llnode *next = it->next;
+        free(it);
+        it = next;
+    }
+    list->head = list->tail = NULL;
+    list->count = 0;
+}
+
+/* Add raw data into a new llnode at tail; data is copied into node->data.
+ * Returns pointer to created llnode or NULL on error.
+ */
+static struct llnode *llist_add_raw(struct net_iface_list *list, const void *data, size_t data_size)
+{
+    if (!list || !data || data_size == 0 || data_size > LLNODE_DATA_MAX_SIZE) return NULL;
+    struct llnode *n = malloc(sizeof(*n));
+    if (!n) return NULL;
+    n->prev = list->tail;
+    n->next = NULL;
+    n->data_size = data_size;
+    memcpy(n->data, data, data_size);
+    if (list->tail) list->tail->next = n;
+    list->tail = n;
+    if (!list->head) list->head = n;
+    list->count++;
+    return n;
+}
+
+/* Find node by exact data match (size+memcmp). Returns node pointer or NULL */
+static struct llnode *llist_find_node_by_data(struct net_iface_list *list, const void *data, size_t data_size)
+{
+    if (!list || !data || data_size == 0) return NULL;
+    struct llnode *it = list->head;
+    while (it) {
+        if (it->data_size == data_size && memcmp(it->data, data, data_size) == 0) {
+            return it;
+        }
+        it = it->next;
+    }
+    return NULL;
+}
+
+/* Remove given node (unlink and free) */
+static void llist_remove_node(struct net_iface_list *list, struct llnode *node)
+{
+    if (!list || !node) return;
+    if (node->prev) node->prev->next = node->next;
+    else list->head = node->next;
+    if (node->next) node->next->prev = node->prev;
+    else list->tail = node->prev;
+    list->count--;
+    free(node);
+}
+
+/* Add unique data: if data exists, return 0; if added successfully return 1; on error -1 */
+static int llist_add_unique(struct net_iface_list *list, const void *data, size_t data_size)
+{
+    if (!list || !data || data_size == 0) return -1;
+    if (llist_find_node_by_data(list, data, data_size)) return 0;
+    struct llnode *n = llist_add_raw(list, data, data_size);
+    return n ? 1 : -1;
+}
+
+/* Remove by data; returns 1 if removed, 0 if not found, -1 on error */
+static int llist_remove_by_data(struct net_iface_list *list, const void *data, size_t data_size)
+{
+    if (!list || !data || data_size == 0) return -1;
+    struct llnode *n = llist_find_node_by_data(list, data, data_size);
+    if (!n) return 0;
+    llist_remove_node(list, n);
+    return 1;
+}
+
+/* ---------- net_iface-specific list API (keeps old naming) ---------- */
+
+/* initialize a single net_iface payload (reset fields) */
 static void net_iface_init_one(struct net_iface *niface)
 {
     if (!niface) return;
@@ -106,78 +191,110 @@ static void net_iface_init_one(struct net_iface *niface)
     niface->carrier = -1;
     niface->mtu = -1u;
     memset(niface->mac, 0, sizeof niface->mac);
-    memset(niface->ipv4, 0, sizeof niface->ipv4);
-    memset(niface->ipv6, 0, sizeof niface->ipv6);
-    niface->prev = niface->next = NULL;
+    llist_init(&niface->ipv4_addrs);
+    llist_init(&niface->ipv6_addrs);
 }
 
-/* initialize list manager */
+/* net_iface_list is used as a generic list manager that stores llnodes whose
+ * payload is a struct net_iface. Keep API names as before but operate on
+ * llnodes underneath.
+ */
 static void net_iface_list_init(struct net_iface_list *list)
 {
-    if (!list) return;
-    list->head = list->tail = NULL;
-    list->count = 0;
+    llist_init(list);
 }
 
-/* free all nodes in the list */
+/* Free all llnodes; used on top-level list (will free stored net_iface payloads
+ * but must also free nested addr lists first — handled in removal helper).
+ */
 static void net_iface_list_free_all(struct net_iface_list *list)
 {
     if (!list) return;
-    struct net_iface *it = list->head;
+    /* For net_iface list we must clean up nested address lists for each stored iface */
+    struct llnode *it = list->head;
     while (it) {
-        struct net_iface *next = it->next;
-        free(it);
-        it = next;
+        /* access stored net_iface payload */
+        if (it->data_size >= sizeof(struct net_iface)) {
+            struct net_iface *stored = (struct net_iface *)it->data;
+            llist_free_all(&stored->ipv4_addrs);
+            llist_free_all(&stored->ipv6_addrs);
+        }
+        it = it->next;
     }
-    list->head = list->tail = NULL;
-    list->count = 0;
+    /* Now free all nodes themselves */
+    llist_free_all(list);
 }
 
-/* add node (takes ownership of node pointer) to tail */
-static void net_iface_list_add_node(struct net_iface_list *list, struct net_iface *node)
+/* Add an empty net_iface entry and return pointer to the stored struct net_iface (or NULL) */
+static struct net_iface *net_iface_list_add_empty(struct net_iface_list *list)
 {
-    if (!list || !node) return;
-    node->prev = list->tail;
-    node->next = NULL;
-    if (list->tail) list->tail->next = node;
-    list->tail = node;
-    if (!list->head) list->head = node;
-    list->count++;
+    if (!list) return NULL;
+    /* create zeroed payload of size struct net_iface */
+    unsigned char tmp[sizeof(struct net_iface)];
+    memset(tmp, 0, sizeof tmp);
+    struct llnode *n = llist_add_raw(list, tmp, sizeof(struct net_iface));
+    if (!n) return NULL;
+    struct net_iface *stored = (struct net_iface *)n->data;
+    net_iface_init_one(stored);
+    return stored;
 }
 
-/* find node by index */
+/* Find by index: return pointer to stored struct net_iface or NULL */
 static struct net_iface *net_iface_list_find_by_index(struct net_iface_list *list, int index)
 {
     if (!list) return NULL;
-    struct net_iface *it = list->head;
+    struct llnode *it = list->head;
     while (it) {
-        if (it->index == index) return it;
+        if (it->data_size >= sizeof(struct net_iface)) {
+            struct net_iface *stored = (struct net_iface *)it->data;
+            if (stored->index == index) return stored;
+        }
         it = it->next;
     }
     return NULL;
 }
 
-/* remove node by index (frees node). return 0 on success, -1 if not found */
+/* Remove a net_iface by index; frees nested addr lists and the node */
 static int net_iface_list_remove_by_index(struct net_iface_list *list, int index)
 {
     if (!list) return -1;
-    struct net_iface *it = list->head;
+    struct llnode *it = list->head;
     while (it) {
-        if (it->index == index) {
-            if (it->prev) it->prev->next = it->next;
-            else list->head = it->next;
-            if (it->next) it->next->prev = it->prev;
-            else list->tail = it->prev;
-            list->count--;
-            free(it);
-            return 0;
+        if (it->data_size >= sizeof(struct net_iface)) {
+            struct net_iface *stored = (struct net_iface *)it->data;
+            if (stored->index == index) {
+                /* free nested address lists first */
+                llist_free_all(&stored->ipv4_addrs);
+                llist_free_all(&stored->ipv6_addrs);
+                /* now remove this node */
+                llist_remove_node(list, it);
+                return 0;
+            }
         }
         it = it->next;
     }
     return -1;
 }
 
-/* helper: check if buffer empty */
+/* Helper to add unique address to per-interface addr list.
+ * addr_len must be 4 (IPv4) or 16 (IPv6). Returns:
+ *  1 = added (unique)
+ *  0 = already present (duplicate)
+ * -1 = error
+ */
+static int net_iface_address_add_unique(struct net_iface_list *addr_list, const unsigned char *addr, size_t addr_len)
+{
+    return llist_add_unique(addr_list, addr, addr_len);
+}
+
+/* Helper to remove address from per-interface addr list.
+ * Returns 1 if removed, 0 if not found, -1 on error.
+ */
+static int net_iface_address_remove(struct net_iface_list *addr_list, const unsigned char *addr, size_t addr_len)
+{
+    return llist_remove_by_data(addr_list, addr, addr_len);
+}
+
 static int net_iface_is_buf_empty(const unsigned char *buf, size_t len)
 {
     int i;
@@ -192,11 +309,6 @@ static int net_iface_is_buf_empty(const unsigned char *buf, size_t len)
 static int net_iface_is_mac_set(const struct net_iface *niface)
 {
     return !net_iface_is_buf_empty(niface->mac, sizeof niface->mac);
-}
-
-static int net_iface_is_ipv6_set(const struct net_iface *niface)
-{
-    return !net_iface_is_buf_empty(niface->ipv6, sizeof niface->ipv6);
 }
 
 static int net_iface_is_mac_equal(const struct net_iface *one, const struct net_iface *other)
@@ -228,6 +340,8 @@ static int net_iface_should_ignore(const struct net_iface *niface, const char *f
     return 0;
 }
 
+/* ---------- netlink socket / parsing (mostly unchanged) ---------- */
+
 static int nl_monitor_init(size_t nl_event_mask)
 {
     int rc = 0;
@@ -257,7 +371,11 @@ err:
     return -1;
 }
 
-static void nl_monitor_parse_rtmgrp_link(const struct nlmsghdr *nlh, struct net_iface *niface)
+/* Parsing helpers identical to previous behavior, but note: temporary 'current'
+ * we use here keeps ipv4/ipv6 buffers local so that we can add/remove them to
+ * per-interface lists.
+ */
+static void nl_monitor_parse_rtmgrp_link(const struct nlmsghdr *nlh, struct net_iface *niface, unsigned char *tmp_ipv4, unsigned char *tmp_ipv6)
 {
     struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
     struct rtattr *rtattr;
@@ -266,12 +384,6 @@ static void nl_monitor_parse_rtmgrp_link(const struct nlmsghdr *nlh, struct net_
     niface->index = ifi->ifi_index;
     niface->flags = ifi->ifi_flags;
     niface->change = ifi->ifi_change;
-
-    /* Description of message attributes can be found here
-     * https://www.man7.org/linux/man-pages/man7/rtnetlink.7.html
-     * uapi/linux/if_link.h
-     * https://www.kernel.org/doc/html/next/networking/netlink_spec/rt_link.html#rt-link-attribute-set-link-attrs
-     */
 
     /* Parse link layer attributes */
     for (rtattr = IFLA_RTA(ifi); RTA_OK(rtattr, rtattrlen); rtattr = RTA_NEXT(rtattr, rtattrlen)) {
@@ -291,27 +403,38 @@ static void nl_monitor_parse_rtmgrp_link(const struct nlmsghdr *nlh, struct net_
             niface->mtu = *((unsigned *)RTA_DATA(rtattr));
             break;
         case IFLA_ADDRESS:
+            memset(niface->mac, 0, sizeof niface->mac);
             memcpy(niface->mac, (unsigned char *)RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
             break;
         default:
             break;
         }
     }
+    /* tmp ipv4/ipv6 not used in link parsing */
+    (void)tmp_ipv4;
+    (void)tmp_ipv6;
 }
 
-static void nl_monitor_parse_rtmgrp_addr(const struct nlmsghdr *nlh, struct net_iface *niface)
+static void nl_monitor_parse_rtmgrp_addr(const struct nlmsghdr *nlh, unsigned char *tmp_ipv4, unsigned char *tmp_ipv6, int *is_ipv6)
 {
     struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nlh);
     struct rtattr *rtattr;
     size_t rtattrlen = IFA_PAYLOAD(nlh);
 
+    /* initialize flags */
+    *is_ipv6 = 0;
+    memset(tmp_ipv4, 0, NL_IPV4_LEN);
+    memset(tmp_ipv6, 0, NL_IPV6_LEN);
+
     for (rtattr = IFA_RTA(ifa); RTA_OK(rtattr, rtattrlen); rtattr = RTA_NEXT(rtattr, rtattrlen)) {
         switch (rtattr->rta_type) {
         case IFA_ADDRESS:
             if (RTA_PAYLOAD(rtattr) == NL_IPV6_LEN) {
-                memcpy(niface->ipv6, (unsigned char *)RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
+                memcpy(tmp_ipv6, (unsigned char *)RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
+                *is_ipv6 = 1;
             } else {
-                memcpy(niface->ipv4, (unsigned char *)RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
+                memcpy(tmp_ipv4, (unsigned char *)RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
+                *is_ipv6 = 0;
             }
             break;
         default:
@@ -320,12 +443,10 @@ static void nl_monitor_parse_rtmgrp_addr(const struct nlmsghdr *nlh, struct net_
     }
 }
 
-/* Now handle messages using a dynamically-sized linked list of interfaces */
+/* Now handle messages using dynamically-sized lists and per-interface address lists */
 static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface_list *list,
                                   const char *filter)
 {
-    /* https://linux.die.net/man/7/rtnetlink */
-
     struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
     struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nlh);
 
@@ -336,6 +457,20 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface_l
         iface_index = ifi->ifi_index;
     }
 
+    /* Try to find stored iface by index */
+    struct net_iface *old = net_iface_list_find_by_index(list, iface_index);
+
+    /* If we don't have a stored entry, create one (no fixed limit) */
+    if (old == NULL) {
+        old = net_iface_list_add_empty(list);
+        if (!old) {
+            fprintf(stderr, "ERROR: memory allocation failed for new interface entry\n");
+            return;
+        }
+        /* index will be filled by parsing */
+        old->index = -1;
+    }
+
     char timestamp[100];
     time_t current_time = time(NULL);
     struct tm *time_struct = localtime(&current_time);
@@ -343,50 +478,40 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface_l
     /* Output timestamp in format YYYY-MM-DD HH:MM:SS */
     strftime(timestamp, sizeof timestamp, "%Y-%m-%d %H:%M:%S", time_struct);
 
-    /* Retrieve current information about the interface */
-    struct net_iface current;
-    net_iface_init_one(&current);
+    /* Temporary current info and tmp addr buffers */
+    struct net_iface current_tmp;
+    net_iface_init_one(&current_tmp); /* initializes nested lists but they won't be used for temp */
+    unsigned char tmp_ipv4[NL_IPV4_LEN];
+    unsigned char tmp_ipv6[NL_IPV6_LEN];
+    int tmp_is_ipv6 = 0;
 
     if (nlh->nlmsg_type == RTM_NEWADDR || nlh->nlmsg_type == RTM_DELADDR) {
-        nl_monitor_parse_rtmgrp_addr(nlh, &current);
+        nl_monitor_parse_rtmgrp_addr(nlh, tmp_ipv4, tmp_ipv6, &tmp_is_ipv6);
     } else {
-        nl_monitor_parse_rtmgrp_link(nlh, &current);
+        nl_monitor_parse_rtmgrp_link(nlh, &current_tmp, tmp_ipv4, tmp_ipv6);
     }
 
-    if (current.ifname[0] == 0) {
-        if_indextoname(iface_index, current.ifname);
+    if (current_tmp.ifname[0] == 0) {
+        if_indextoname(iface_index, current_tmp.ifname);
     }
 
-    if (net_iface_should_ignore(&current, filter)) {
+    if (net_iface_should_ignore(&current_tmp, filter)) {
         return;
-    }
-
-    struct net_iface *old = net_iface_list_find_by_index(list, iface_index);
-
-    /* If we don't have a stored entry, create one (no fixed limit) */
-    if (old == NULL) {
-        old = calloc(1, sizeof(*old));
-        if (!old) {
-            fprintf(stderr, "ERROR: memory allocation failed for new interface entry\n");
-            return;
-        }
-        net_iface_init_one(old);
-        /* We don't yet know index/name until parsing current; keep index=-1 as marker */
-        net_iface_list_add_node(list, old);
     }
 
     switch (nlh->nlmsg_type) {
     case RTM_DELLINK:
-        printf("[%s] Interface %s removed\n", timestamp, current.ifname);
-        /* remove stored entry for this interface */
+        printf("[%s] Interface %s removed\n", timestamp, current_tmp.ifname);
+        /* remove stored entry for this interface (frees nested addr lists) */
         (void) net_iface_list_remove_by_index(list, iface_index);
         break;
     case RTM_NEWLINK: {
-        unsigned status_changed = current.flags ^ old->flags;
+        /* When handling links, old points to stored payload (may have index -1) */
+        unsigned status_changed = current_tmp.flags ^ old->flags;
         unsigned carrier_changed = 0;
 
-        if (current.carrier != -1) {
-            carrier_changed = current.carrier != old->carrier;
+        if (current_tmp.carrier != -1) {
+            carrier_changed = current_tmp.carrier != old->carrier;
         }
 
         if (old->index == -1) {
@@ -396,88 +521,114 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface_l
         }
 
         if ((old->index == -1) || (status_changed & IFF_UP) || carrier_changed) {
-            int carrier = current.carrier;
+            int carrier = current_tmp.carrier;
             if (carrier == -1) {
                 carrier = old->carrier;
             }
 
-            if (current.change == -1u) {
+            if (current_tmp.change == -1u) {
                 /* According to linux kernel when new interface is added change bitmap
                  * is set to max unsigned int. See /net/core/dev.c::register_netdevice
                  */
-                printf("[%s] Interface %s added\n", timestamp, current.ifname);
+                printf("[%s] Interface %s added\n", timestamp, current_tmp.ifname);
             }
 
             if (carrier == -1) {
-                printf("[%s] Interface %s is %s\n", timestamp, current.ifname,
-                       (current.flags & IFF_UP) ? "UP" : "DOWN");
+                printf("[%s] Interface %s is %s\n", timestamp, current_tmp.ifname,
+                       (current_tmp.flags & IFF_UP) ? "UP" : "DOWN");
             } else {
-                printf("[%s] Interface %s is %s (carrier %s)\n", timestamp, current.ifname,
-                       (current.flags & IFF_UP) ? "UP" : "DOWN",
+                printf("[%s] Interface %s is %s (carrier %s)\n", timestamp, current_tmp.ifname,
+                       (current_tmp.flags & IFF_UP) ? "UP" : "DOWN",
                        carrier ? "ON" : "OFF");
             }
         }
 
         /* Check if MTU changed */
-        if (current.mtu != -1u && current.mtu != old->mtu) {
+        if (current_tmp.mtu != -1u && current_tmp.mtu != old->mtu) {
             if (old->mtu != -1u) {
-                printf("[%s] MTU for interface %s changed %u -> %u\n", timestamp, current.ifname,
-                       old->mtu, current.mtu);
+                printf("[%s] MTU for interface %s changed %u -> %u\n", timestamp, current_tmp.ifname,
+                       old->mtu, current_tmp.mtu);
             } else {
-                printf("[%s] MTU for interface %s is set to %u\n", timestamp, current.ifname, current.mtu);
+                printf("[%s] MTU for interface %s is set to %u\n", timestamp, current_tmp.ifname, current_tmp.mtu);
             }
-            old->mtu = current.mtu;
+            old->mtu = current_tmp.mtu;
         }
 
         /* Check if mac address changed */
-        if (net_iface_is_mac_set(&current) && !net_iface_is_mac_equal(old, &current)) {
+        if (net_iface_is_mac_set(&current_tmp) && !net_iface_is_mac_equal(old, &current_tmp)) {
             if (!net_iface_is_mac_set(old)) {
-                printf("[%s] MAC for interface %s is set to "NL_MAC_STR_FMT"\n", timestamp, current.ifname,
-                   NL_MAC_STR_FMT_BYTES(current.mac));
+                printf("[%s] MAC for interface %s is set to "NL_MAC_STR_FMT"\n", timestamp, current_tmp.ifname,
+                   NL_MAC_STR_FMT_BYTES(current_tmp.mac));
             } else {
-                printf("[%s] MAC for interface %s changed "NL_MAC_STR_FMT" -> "NL_MAC_STR_FMT"\n", timestamp, current.ifname,
-                       NL_MAC_STR_FMT_BYTES(old->mac), NL_MAC_STR_FMT_BYTES(current.mac));
+                printf("[%s] MAC for interface %s changed "NL_MAC_STR_FMT" -> "NL_MAC_STR_FMT"\n", timestamp, current_tmp.ifname,
+                       NL_MAC_STR_FMT_BYTES(old->mac), NL_MAC_STR_FMT_BYTES(current_tmp.mac));
             }
-            memcpy(old->mac, current.mac, sizeof old->mac);
+            memcpy(old->mac, current_tmp.mac, sizeof old->mac);
         }
 
         /* update stored info */
-        old->index = current.index;
-        old->flags = current.flags;
+        old->index = current_tmp.index;
+        old->flags = current_tmp.flags;
 
-        if (current.carrier != -1) {
-            old->carrier = current.carrier;
+        if (current_tmp.carrier != -1) {
+            old->carrier = current_tmp.carrier;
         }
 
         /* ensure name is set (sometimes parsed payload lacks ifname) */
-        if (current.ifname[0] != 0 && (old->ifname[0] == 0 || strcmp(old->ifname, current.ifname) != 0)) {
-            strncpy(old->ifname, current.ifname, IFNAMSIZ - 1);
+        if (current_tmp.ifname[0] != 0 && (old->ifname[0] == 0 || strcmp(old->ifname, current_tmp.ifname) != 0)) {
+            strncpy(old->ifname, current_tmp.ifname, IFNAMSIZ - 1);
             old->ifname[IFNAMSIZ - 1] = '\0';
         }
 
         break;
     }
-    case RTM_DELADDR:
-        if (net_iface_is_ipv6_set(&current)) {
-            printf("[%s] Removed IPV6 address "NL_IPV6_STR_FMT" from interface %s\n", timestamp,
-                   NL_IPV6_STR_FMT_BYTES(current.ipv6), current.ifname);
+    case RTM_DELADDR: {
+        /* tmp_is_ipv6 indicates which buffer is filled */
+        if (tmp_is_ipv6) {
+            int removed = net_iface_address_remove(&old->ipv6_addrs, tmp_ipv6, NL_IPV6_LEN);
+            if (removed == 1) {
+                printf("[%s] Removed IPV6 address "NL_IPV6_STR_FMT" from interface %s\n", timestamp,
+                       NL_IPV6_STR_FMT_BYTES(tmp_ipv6), current_tmp.ifname);
+            } else {
+                /* ignore duplicate del notifications for unknown address */
+            }
         } else {
-            printf("[%s] Removed IPV4 address "NL_IPV4_STR_FMT" from interface %s\n", timestamp,
-                   NL_IPV4_STR_FMT_BYTES(current.ipv4), current.ifname);
-        }
-        break;
-    case RTM_NEWADDR:
-        if (net_iface_is_ipv6_set(&current)) {
-            printf("[%s] New IPV6 address "NL_IPV6_STR_FMT" set on interface %s\n", timestamp,
-                   NL_IPV6_STR_FMT_BYTES(current.ipv6), current.ifname);
-        } else {
-            printf("[%s] New IPV4 address "NL_IPV4_STR_FMT" set on interface %s\n", timestamp,
-                   NL_IPV4_STR_FMT_BYTES(current.ipv4), current.ifname);
+            int removed = net_iface_address_remove(&old->ipv4_addrs, tmp_ipv4, NL_IPV4_LEN);
+            if (removed == 1) {
+                printf("[%s] Removed IPV4 address "NL_IPV4_STR_FMT" from interface %s\n", timestamp,
+                       NL_IPV4_STR_FMT_BYTES(tmp_ipv4), current_tmp.ifname);
+            } else {
+                /* ignore duplicate del notifications for unknown address */
+            }
         }
         break;
     }
+    case RTM_NEWADDR: {
+        if (tmp_is_ipv6) {
+            int added = net_iface_address_add_unique(&old->ipv6_addrs, tmp_ipv6, NL_IPV6_LEN);
+            if (added == 1) {
+                printf("[%s] New IPV6 address "NL_IPV6_STR_FMT" set on interface %s\n", timestamp,
+                       NL_IPV6_STR_FMT_BYTES(tmp_ipv6), current_tmp.ifname);
+            } else {
+                /* duplicate newaddr notification -> ignore */
+            }
+        } else {
+            int added = net_iface_address_add_unique(&old->ipv4_addrs, tmp_ipv4, NL_IPV4_LEN);
+            if (added == 1) {
+                printf("[%s] New IPV4 address "NL_IPV4_STR_FMT" set on interface %s\n", timestamp,
+                       NL_IPV4_STR_FMT_BYTES(tmp_ipv4), current_tmp.ifname);
+            } else {
+                /* duplicate newaddr notification -> ignore */
+            }
+        }
+        break;
+    }
+    }
 }
 
+/* Modified to support graceful shutdown via g_stop flag set by SIGINT/SIGTERM.
+ * The function returns after cleanup (so main can close socket_fd).
+ */
 static void nl_monitor_start(int socket_fd, const char *filter)
 {
     int epfd = epoll_create(1);
@@ -501,22 +652,22 @@ static void nl_monitor_start(int socket_fd, const char *filter)
     struct net_iface_list nifaces;
     net_iface_list_init(&nifaces);
 
-    for (;;) {
+    while (!g_stop) {
         struct epoll_event events[NL_MAX_EVENTS];
 
         int ready = epoll_wait(epfd, events, (sizeof events) / (sizeof *events), -1);
 
-        /* Continue in case epoll_wait was interrupted by signal */
-        if (ready == -1 && errno == EINTR) {
-            continue;
-        }
-
+        /* If interrupted by signal, check stop flag and break if requested */
         if (ready == -1) {
+            if (errno == EINTR) {
+                if (g_stop) break;
+                else continue;
+            }
             perror("failed epoll_wait()");
-            goto err;
+            goto err_cleanup;
         }
 
-        for (int i = 0; i < ready; i++) {
+        for (int i = 0; i < ready && !g_stop; i++) {
             if (events[i].events & EPOLLIN) {
                 struct msghdr msg;
                 struct iovec iov[1];
@@ -529,28 +680,30 @@ static void nl_monitor_start(int socket_fd, const char *filter)
                 msg.msg_iovlen = 1;
 
                 for (;;) {
+                    if (g_stop) break;
 
-                    ssize_t read = recvmsg(events[i].data.fd, &msg, MSG_DONTWAIT);
+                    ssize_t read_len = recvmsg(events[i].data.fd, &msg, MSG_DONTWAIT);
 
-                    if (read == -1) {
+                    if (read_len == -1) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                             /* Now its safe to invoke edge-triggered epoll_wait */
                             break;
                         } else if (errno == EINTR) {
-                            continue;
+                            if (g_stop) break;
+                            else continue;
                         } else {
                             perror("failed recv()");
-                            goto err;
+                            goto err_cleanup;
                         }
                     } else {
-                        /* Check if buffer was to small for message */
+                        /* Check if buffer was too small for message */
                         if (msg.msg_flags & MSG_TRUNC) {
                             fprintf(stderr, "WARNING: received netlink message was truncated\n");
                         }
 
                         /* Process netlink messages */
                         struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-                        for (; NLMSG_OK(nlh, read); nlh = NLMSG_NEXT(nlh, read)) {
+                        for (; NLMSG_OK(nlh, read_len) && !g_stop; nlh = NLMSG_NEXT(nlh, read_len)) {
                             nl_monitor_handle_msg(nlh, &nifaces, filter);
                         }
                     }
@@ -559,14 +712,30 @@ static void nl_monitor_start(int socket_fd, const char *filter)
         }
     }
 
-err:
-    /* cleanup list */
+err_cleanup:
+    /* cleanup list (frees nested addr lists too) */
     net_iface_list_free_all(&nifaces);
     close(epfd);
+    return;
+
+err:
+    /* If we reached an unrecoverable error path, still cleanup */
+    net_iface_list_free_all(&nifaces);
+    close(epfd);
+    return;
 }
 
 int main(int argc, char **argv)
 {
+    /* Install signal handler for graceful shutdown so we free allocated memory */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     const char *filter = NULL;
 
     if (argc == 2) {

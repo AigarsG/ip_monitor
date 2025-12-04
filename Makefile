@@ -1,7 +1,7 @@
 TARGET = monitor
 SRC = $(TARGET).c
 OBJ = $(SRC:.c=.o)
-CFLAGS = -Wall -Werror --std=c99 -I.
+CFLAGS = -Wall -Werror --std=c99 -I. -D_POSIX_C_SOURCE=200809L
 
 all: $(TARGET)
 
