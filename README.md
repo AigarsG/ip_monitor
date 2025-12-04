@@ -1,21 +1,35 @@
 ## About
-Simple network interface monitoring program based on netlink which captures link layer and IPV4/IPV6 address changes.
+Simple network interface monitoring program based on netlink which captures link layer and IPv4/IPv6 address changes.
 
 ## Approach
 1) Netlink socket is opened
-2) epoll instance is used to wait for netlink socket to become readable
-3) Once it becomes readable, we read and parse netlink messages, caching interface data for fixed number of interfaces determined by NL_MONITOR_NET_IFACE_MAX_COUNT, until reading from netlink socket returns either EAGAIN or EWOULDBLOCK, indicating there is no more data to read
-4) Either current interface state and config is output or changes if previously cached are output
+2) epoll instance is used to wait for the netlink socket to become readable
+3) Once readable, the program reads and parses netlink messages, caching per-interface state in a dynamically sized linked list. Reading continues until recvmsg() returns EAGAIN or EWOULDBLOCK, indicating there is no more data to read.
+4) Either the current interface state is output or the detected changes (compared to the cached state) are output.
 5) Back to step 2
+
+Notes
+- There is no longer a compile-time limit (NL_MONITOR_NET_IFACE_MAX_COUNT) on how many interfaces may be tracked. Entries are allocated on demand and freed when an interface is removed.
+- The program is single-threaded; if you integrate this code into a multi-threaded application, add synchronization around the interface list.
 
 ## Build
 `cd ip_monitor && make`
-## Execute and check
-On one terminal monitor changes on all interfaces by running `[term1] ./monitor`
-or monitor a particular interface `[term1] ./monitor enp1s0`
-or monitor set of interfaces starting with prefix `[term1] ./monitor enp*`
 
-On another terminal verify changes are monitored
+## Execute and check
+On one terminal monitor changes on all interfaces by running:
+```
+[term1] ./monitor
+```
+or monitor a particular interface:
+```
+[term1] ./monitor enp1s0
+```
+or monitor a set of interfaces starting with a prefix:
+```
+[term1] ./monitor enp*
+```
+
+On another terminal verify changes are monitored:
 ```
 [term2] sudo ip link add eth99 type dummy
 ```
