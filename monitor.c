@@ -336,20 +336,6 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface_l
         iface_index = ifi->ifi_index;
     }
 
-    struct net_iface *old = net_iface_list_find_by_index(list, iface_index);
-
-    /* If we don't have a stored entry, create one (no fixed limit) */
-    if (old == NULL) {
-        old = calloc(1, sizeof(*old));
-        if (!old) {
-            fprintf(stderr, "ERROR: memory allocation failed for new interface entry\n");
-            return;
-        }
-        net_iface_init_one(old);
-        /* We don't yet know index/name until parsing current; keep index=-1 as marker */
-        net_iface_list_add_node(list, old);
-    }
-
     char timestamp[100];
     time_t current_time = time(NULL);
     struct tm *time_struct = localtime(&current_time);
@@ -373,6 +359,20 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface_l
 
     if (net_iface_should_ignore(&current, filter)) {
         return;
+    }
+
+    struct net_iface *old = net_iface_list_find_by_index(list, iface_index);
+
+    /* If we don't have a stored entry, create one (no fixed limit) */
+    if (old == NULL) {
+        old = calloc(1, sizeof(*old));
+        if (!old) {
+            fprintf(stderr, "ERROR: memory allocation failed for new interface entry\n");
+            return;
+        }
+        net_iface_init_one(old);
+        /* We don't yet know index/name until parsing current; keep index=-1 as marker */
+        net_iface_list_add_node(list, old);
     }
 
     switch (nlh->nlmsg_type) {
