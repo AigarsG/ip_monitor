@@ -50,10 +50,12 @@ Some guides on how to listen for netdev events
 #include <linux/if.h>
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
+#include <stdlib.h>
 
 #define NL_BUF_SIZE 8192
 #define NL_MAX_EVENTS 8
-#define NL_MONITOR_NET_IFACE_MAX_COUNT 20
+/* removed fixed-size interface limit to allow arbitrary number of interfaces */
+/* #define NL_MONITOR_NET_IFACE_MAX_COUNT 20 */
 #define NL_IPV4_LEN 4
 #define NL_IPV6_LEN 16
 
@@ -80,51 +82,106 @@ struct net_iface {
     unsigned char mac[ETH_ALEN];
     unsigned char ipv4[NL_IPV4_LEN];
     unsigned char ipv6[NL_IPV6_LEN];
+
+    /* linked list pointers for dynamic storage of arbitrary number of ifaces */
+    struct net_iface *prev;
+    struct net_iface *next;
 };
 
+/* manager for linked list of interfaces */
+struct net_iface_list {
+    struct net_iface *head;
+    struct net_iface *tail;
+    size_t count;
+};
 
-static void net_iface_init(struct net_iface *nifaces, size_t count)
+/* initialize a single net_iface structure (reset fields) */
+static void net_iface_init_one(struct net_iface *niface)
 {
-    int i;
-    for (i = 0; i < count; i++) {
-        memset(nifaces[i].ifname, 0, sizeof nifaces[i].ifname);
-        nifaces[i].index = -1;
-        nifaces[i].flags = -1u;
-        nifaces[i].change = -1u;
-        nifaces[i].carrier = -1;
-        nifaces[i].mtu = -1u;
-        memset(nifaces[i].mac, 0, sizeof nifaces[i].mac);
-        memset(nifaces[i].ipv4, 0, sizeof nifaces[i].ipv4);
-        memset(nifaces[i].ipv6, 0, sizeof nifaces[i].ipv6);
-    }
+    if (!niface) return;
+    memset(niface->ifname, 0, sizeof niface->ifname);
+    niface->index = -1;
+    niface->flags = -1u;
+    niface->change = -1u;
+    niface->carrier = -1;
+    niface->mtu = -1u;
+    memset(niface->mac, 0, sizeof niface->mac);
+    memset(niface->ipv4, 0, sizeof niface->ipv4);
+    memset(niface->ipv6, 0, sizeof niface->ipv6);
+    niface->prev = niface->next = NULL;
 }
 
-static struct net_iface *net_iface_find_by_index(int index, struct net_iface *nifaces, size_t count)
+/* initialize list manager */
+static void net_iface_list_init(struct net_iface_list *list)
 {
-    int i;
-    for (i = 0; i < count; i++) {
-        if (index == nifaces[i].index) {
-            return &nifaces[i];
-        }
+    if (!list) return;
+    list->head = list->tail = NULL;
+    list->count = 0;
+}
+
+/* free all nodes in the list */
+static void net_iface_list_free_all(struct net_iface_list *list)
+{
+    if (!list) return;
+    struct net_iface *it = list->head;
+    while (it) {
+        struct net_iface *next = it->next;
+        free(it);
+        it = next;
+    }
+    list->head = list->tail = NULL;
+    list->count = 0;
+}
+
+/* add node (takes ownership of node pointer) to tail */
+static void net_iface_list_add_node(struct net_iface_list *list, struct net_iface *node)
+{
+    if (!list || !node) return;
+    node->prev = list->tail;
+    node->next = NULL;
+    if (list->tail) list->tail->next = node;
+    list->tail = node;
+    if (!list->head) list->head = node;
+    list->count++;
+}
+
+/* find node by index */
+static struct net_iface *net_iface_list_find_by_index(struct net_iface_list *list, int index)
+{
+    if (!list) return NULL;
+    struct net_iface *it = list->head;
+    while (it) {
+        if (it->index == index) return it;
+        it = it->next;
     }
     return NULL;
 }
 
-static struct net_iface *net_iface_next_empty(struct net_iface *nifaces, size_t count)
+/* remove node by index (frees node). return 0 on success, -1 if not found */
+static int net_iface_list_remove_by_index(struct net_iface_list *list, int index)
 {
-    int i;
-    for (i = 0; i < count; i++) {
-        if (nifaces[i].index == -1) {
-            return &nifaces[i];
+    if (!list) return -1;
+    struct net_iface *it = list->head;
+    while (it) {
+        if (it->index == index) {
+            if (it->prev) it->prev->next = it->next;
+            else list->head = it->next;
+            if (it->next) it->next->prev = it->prev;
+            else list->tail = it->prev;
+            list->count--;
+            free(it);
+            return 0;
         }
+        it = it->next;
     }
-    return NULL;
+    return -1;
 }
 
+/* helper: check if buffer empty */
 static int net_iface_is_buf_empty(const unsigned char *buf, size_t len)
 {
     int i;
-    for (i = 0; i < len; i++) {
+    for (i = 0; i < (int)len; i++) {
         if (buf[i] != 0) {
             return 0;
         }
@@ -158,9 +215,9 @@ static int net_iface_should_ignore(const struct net_iface *niface, const char *f
     }
 
     int i;
-    for (i = 0; i < filter_len; i++) {
+    for (i = 0; i < (int)filter_len; i++) {
         if (filter[i] != niface->ifname[i]) {
-            if (filter[i] == '*' && i == filter_len - 1) {
+            if (filter[i] == '*' && i == (int)filter_len - 1) {
                 return 0;
             } else {
                 return 1;
@@ -221,6 +278,11 @@ static void nl_monitor_parse_rtmgrp_link(const struct nlmsghdr *nlh, struct net_
         switch (rtattr->rta_type) {
         case IFLA_IFNAME:
             memcpy(niface->ifname, RTA_DATA(rtattr), RTA_PAYLOAD(rtattr));
+            /* ensure null termination */
+            if (RTA_PAYLOAD(rtattr) < IFNAMSIZ)
+                niface->ifname[RTA_PAYLOAD(rtattr)] = '\0';
+            else
+                niface->ifname[IFNAMSIZ - 1] = '\0';
             break;
         case IFLA_CARRIER:
             niface->carrier = *((unsigned char *)RTA_DATA(rtattr));
@@ -258,7 +320,8 @@ static void nl_monitor_parse_rtmgrp_addr(const struct nlmsghdr *nlh, struct net_
     }
 }
 
-static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *nifaces, size_t count,
+/* Now handle messages using a dynamically-sized linked list of interfaces */
+static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface_list *list,
                                   const char *filter)
 {
     /* https://linux.die.net/man/7/rtnetlink */
@@ -273,15 +336,18 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
         iface_index = ifi->ifi_index;
     }
 
-    struct net_iface *old = net_iface_find_by_index(iface_index, nifaces, count);
-    if (old == NULL) {
-        old = net_iface_next_empty(nifaces, count);
-    }
+    struct net_iface *old = net_iface_list_find_by_index(list, iface_index);
 
-    /* For now track fixed amount of interfaces */
+    /* If we don't have a stored entry, create one (no fixed limit) */
     if (old == NULL) {
-        fprintf(stderr, "ERROR: cannot monitor more than %lu interfaces\n", count);
-        return;
+        old = calloc(1, sizeof(*old));
+        if (!old) {
+            fprintf(stderr, "ERROR: memory allocation failed for new interface entry\n");
+            return;
+        }
+        net_iface_init_one(old);
+        /* We don't yet know index/name until parsing current; keep index=-1 as marker */
+        net_iface_list_add_node(list, old);
     }
 
     char timestamp[100];
@@ -293,7 +359,7 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
 
     /* Retrieve current information about the interface */
     struct net_iface current;
-    net_iface_init(&current, 1);
+    net_iface_init_one(&current);
 
     if (nlh->nlmsg_type == RTM_NEWADDR || nlh->nlmsg_type == RTM_DELADDR) {
         nl_monitor_parse_rtmgrp_addr(nlh, &current);
@@ -302,7 +368,7 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
     }
 
     if (current.ifname[0] == 0) {
-        if_indextoname(ifi->ifi_index, current.ifname);
+        if_indextoname(iface_index, current.ifname);
     }
 
     if (net_iface_should_ignore(&current, filter)) {
@@ -312,7 +378,8 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
     switch (nlh->nlmsg_type) {
     case RTM_DELLINK:
         printf("[%s] Interface %s removed\n", timestamp, current.ifname);
-        net_iface_init(old, 1);
+        /* remove stored entry for this interface */
+        (void) net_iface_list_remove_by_index(list, iface_index);
         break;
     case RTM_NEWLINK: {
         unsigned status_changed = current.flags ^ old->flags;
@@ -374,11 +441,18 @@ static void nl_monitor_handle_msg(const struct nlmsghdr *nlh, struct net_iface *
             memcpy(old->mac, current.mac, sizeof old->mac);
         }
 
+        /* update stored info */
         old->index = current.index;
         old->flags = current.flags;
 
         if (current.carrier != -1) {
             old->carrier = current.carrier;
+        }
+
+        /* ensure name is set (sometimes parsed payload lacks ifname) */
+        if (current.ifname[0] != 0 && (old->ifname[0] == 0 || strcmp(old->ifname, current.ifname) != 0)) {
+            strncpy(old->ifname, current.ifname, IFNAMSIZ - 1);
+            old->ifname[IFNAMSIZ - 1] = '\0';
         }
 
         break;
@@ -423,12 +497,9 @@ static void nl_monitor_start(int socket_fd, const char *filter)
         goto err;
     }
 
-    /* Unfortunatelly we need to cache some data to determine interface changes. For now track
-     * up to NL_MONITOR_NET_IFACE_MAX_COUNT interfaces
-     */
-    int i;
-    struct net_iface nifaces[NL_MONITOR_NET_IFACE_MAX_COUNT];
-    net_iface_init(nifaces, NL_MONITOR_NET_IFACE_MAX_COUNT);
+    /* Use dynamic list to store seen interfaces (no fixed limit) */
+    struct net_iface_list nifaces;
+    net_iface_list_init(&nifaces);
 
     for (;;) {
         struct epoll_event events[NL_MAX_EVENTS];
@@ -445,7 +516,7 @@ static void nl_monitor_start(int socket_fd, const char *filter)
             goto err;
         }
 
-        for (i = 0; i < ready; i++) {
+        for (int i = 0; i < ready; i++) {
             if (events[i].events & EPOLLIN) {
                 struct msghdr msg;
                 struct iovec iov[1];
@@ -480,7 +551,7 @@ static void nl_monitor_start(int socket_fd, const char *filter)
                         /* Process netlink messages */
                         struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
                         for (; NLMSG_OK(nlh, read); nlh = NLMSG_NEXT(nlh, read)) {
-                            nl_monitor_handle_msg(nlh, nifaces, NL_MONITOR_NET_IFACE_MAX_COUNT, filter);
+                            nl_monitor_handle_msg(nlh, &nifaces, filter);
                         }
                     }
                 }
@@ -489,6 +560,8 @@ static void nl_monitor_start(int socket_fd, const char *filter)
     }
 
 err:
+    /* cleanup list */
+    net_iface_list_free_all(&nifaces);
     close(epfd);
 }
 
